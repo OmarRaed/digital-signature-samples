@@ -1,0 +1,245 @@
+package ; // enter your package here
+
+import com.itextpdf.kernel.pdf.*;
+import com.itextpdf.signatures.*;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.security.GeneralSecurityException;
+import java.security.PrivateKey;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
+import java.util.*;
+
+/**
+ * Sign Deferred Class used for signing an LTV enabled files by adding crl to the document dictionary
+ * and along with the signature too and with embedded timestamp
+ */
+public class SignDeferred {
+
+    //Timestamp Client URL
+    private static final String TSA_URL = "https://freetsa.org/tsr";
+
+    //Signature Location in signature Details.
+    private static final String SIGNATURE_LOCATION = "Signature Location";
+
+    //Signature Reason in signature Details.
+    private static final String SIGNATURE_REASON = "Signature Reason";
+
+    private String fieldName;
+    private Collection<byte[]> crlResponses = new ArrayList<>();
+
+    /**
+     * Sign method which is used for signing ltv enabled files
+     */
+    public void sign(String src, String dest, PrivateKey pk, Certificate[] chain)
+            throws IOException, GeneralSecurityException {
+
+        // initialize crl responses
+        initializeCrlResponses(chain);
+
+        // initialize temp file path
+        String temp = "temp_" + dest;
+
+        // sign external
+        signExternalContainer(src, temp);
+
+        // sign deferred
+        signDeferred(temp, dest, pk, chain);
+    }
+
+    /**
+     * Method used for adding information to the pdf dictionary and create the empty space (blank placeholder) 
+     * where the signature will be filled in later
+     */
+    private void signExternalContainer(String src, String dest) throws IOException, GeneralSecurityException {
+
+        // read the file and initialize signer
+        try (PdfReader reader = new PdfReader(src);
+             FileOutputStream destFileStream = new FileOutputStream(dest)) {
+
+            PdfSigner signer = new PdfSigner(reader, destFileStream, new StampingProperties());
+
+            // set the signature reason and location
+            signer.getSignatureAppearance().setLocation(SIGNATURE_LOCATION).setReason(SIGNATURE_REASON);
+
+            PdfDocument doc = signer.getDocument();
+
+            if (doc.getPdfVersion().compareTo(PdfVersion.PDF_2_0) < 0) {
+                doc.getCatalog().addDeveloperExtension(PdfDeveloperExtension.ESIC_1_7_EXTENSIONLEVEL5);
+            }
+
+            // get new signature field name
+            fieldName = signer.getNewSigFieldName();
+
+            /* DictionaryExternalSignatureContainer constructor will create the PdfDictionary for the signature
+             * information and will insert the /Filter and /SubFilter and /dss values into this dictionary.
+             * It will leave just a blank placeholder for the signature that is to be inserted later.
+             */
+            DictionaryExternalSignatureContainer external = new DictionaryExternalSignatureContainer(PdfName.Adobe_PPKLite,
+                    PdfName.Adbe_pkcs7_detached);
+
+            // add DSS to the document catalog
+            doc.getCatalog().put(PdfName.DSS, external.getDssDictionary());
+
+            // Sign the document using an external container.
+            signer.signExternalContainer(external, calculateEstimatedSize());
+        }
+
+    }
+
+    /**
+     * Method used for fill the blank placeholder for the signature using signDeferred
+     */
+    private void signDeferred(String src, String dest, PrivateKey pk
+            , Certificate[] chain) throws IOException, GeneralSecurityException {
+
+        // read the file and initialize signer
+        try (PdfReader reader = new PdfReader(src);
+             FileOutputStream os = new FileOutputStream(dest)) {
+
+            PdfSigner signer = new PdfSigner(reader, os, new StampingProperties());
+
+            IExternalSignatureContainer external = new CustomExternalSignatureContainer(pk, chain);
+
+            // Signs a PDF where space was already reserved. The field must cover the whole document.
+            PdfSigner.signDeferred(signer.getDocument(), fieldName, os, external);
+        } finally {
+            File file = new File(src);
+            Files.delete(file.toPath());
+        }
+    }
+    /**
+     * A Custom Container for adding information to the pdf dictionary
+     */
+    class DictionaryExternalSignatureContainer implements IExternalSignatureContainer {
+
+        private PdfDictionary sigDic;
+
+        public DictionaryExternalSignatureContainer(PdfName filter, PdfName subFilter) {
+            this.sigDic = new PdfDictionary();
+            this.sigDic.put(PdfName.Filter, filter);
+            this.sigDic.put(PdfName.SubFilter, subFilter);
+            this.sigDic.put(PdfName.DSS, createDss());
+        }
+
+        @Override
+        public byte[] sign(InputStream inputStream) {
+            return new byte[0];
+        }
+
+        private PdfDictionary createDss() {
+
+            // get the DSS dictionary if available
+            PdfDictionary dss = sigDic.getAsDictionary(PdfName.DSS);
+
+            // if dss dictionary does not exist creat a new one
+            if (dss == null)
+                dss = new PdfDictionary();
+
+            PdfArray crls = new PdfArray();
+
+            byte[] b;
+            PdfStream ps;
+
+            // loop and add all Crl Responses to the crls array
+            for (byte[] crlResponse : crlResponses) {
+                b = crlResponse;
+                ps = new PdfStream(b);
+                ps.setCompressionLevel(-1);
+                crls.add(ps);
+                crls.setModified();
+            }
+
+            // if crls found add it to the dss
+            if (crls.size() > 0)
+                dss.put(PdfName.CRLs, crls);
+
+            // return the created dss
+            return dss;
+        }
+
+        public PdfDictionary getDssDictionary() {
+            return sigDic.getAsDictionary(PdfName.DSS);
+        }
+
+        @Override
+        public void modifySigningDictionary(PdfDictionary signDic) {
+            signDic.putAll(sigDic);
+        }
+    }
+
+    /**
+     * A Custom Container for implementing the signing method to sign
+     * and adding crl responses to the signature
+     */
+    class CustomExternalSignatureContainer implements IExternalSignatureContainer {
+
+        protected PrivateKey pk;
+        protected Certificate[] chain;
+
+        public CustomExternalSignatureContainer(PrivateKey pk, Certificate[] chain) {
+            this.pk = pk;
+            this.chain = chain;
+        }
+
+        public byte[] sign(InputStream is) throws GeneralSecurityException {
+            try {
+                PrivateKeySignature signature = new PrivateKeySignature(pk, "SHA256", "BC");
+                String hashAlgorithm = signature.getHashAlgorithm();
+                BouncyCastleDigest digest = new BouncyCastleDigest();
+
+                PdfPKCS7 sgn = new PdfPKCS7(null, chain, hashAlgorithm, null, digest, false);
+                byte hash[] = DigestAlgorithms.digest(is, digest.getMessageDigest(hashAlgorithm));
+                byte[] sh = sgn.getAuthenticatedAttributeBytes(hash, PdfSigner.CryptoStandard.CMS, null, crlResponses);
+                byte[] extSignature = signature.sign(sh);
+                sgn.setExternalDigest(extSignature, null, signature.getEncryptionAlgorithm());
+
+                ITSAClient tsaClient = new TSAClientBouncyCastle(TSA_URL, null, null
+                        , 4192, "SHA-256");
+
+                return sgn.getEncodedPKCS7(hash, PdfSigner.CryptoStandard.CMS, tsaClient, null, crlResponses);
+            } catch (IOException ioe) {
+                throw new RuntimeException(ioe);
+            }
+        }
+
+        public void modifySigningDictionary(PdfDictionary signDic) {
+        }
+    }
+
+    /**
+     * Method to get the certificate revoked list, initialize the crl response
+     */
+    private void initializeCrlResponses(Certificate[] chain) {
+
+        // initialize CrlClients
+        List<ICrlClient> crlClients = Collections
+                .singletonList(new CrlClientOnline(chain));
+        crlResponses = crlClients.get(0).getEncoded((X509Certificate) chain[0], null);
+
+    }
+
+    /**
+     * Method to calculate the estimated size of the created signature container
+     */
+    private int calculateEstimatedSize() {
+
+        // initialize with 8192 for the signature
+        int estimatedSize = 8192;
+
+        // for crl responses
+        for (byte[] crlResponse : crlResponses) estimatedSize += crlResponse.length + 10;
+
+        // for ocsp responses
+//        estimatedSize += 4192;
+
+        // for embedded timestamp
+        estimatedSize += 4192;
+
+        return estimatedSize;
+    }
+}
